@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>CredChainX - Credential Issuance & Verification</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: Arial, sans-serif; background: #f9f9f9; margin: 0; padding: 20px; }
+    .container { max-width: 800px; margin: auto; background: #fff; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+    .section { border: 1px solid #ccc; padding: 20px; margin-bottom: 20px; }
+    label { display: block; margin-top: 10px; }
+    input, textarea, select, button { width: 100%; padding: 8px; margin-top: 4px; }
+    button { margin-top: 10px; }
+    #qrCode { margin-top: 20px; }
+    /* Hide the verification result page initially */
+    #verificationResultPage { display: none; }
+    /* The live QR scanner container */
+    #qr-reader { width: 300px; margin-top: 20px; display: none; }
+  </style>
+  <!-- Include dependencies -->
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
+  <!-- html5-qrcode library for camera scanning -->
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+  <!-- jsQR library for file scanning -->
+  <script src="https://unpkg.com/jsqr/dist/jsQR.js"></script>
+</head>
+<body>
+  <div class="container">
+    <h1>CredChainX - Credential Issuance & Verification</h1>
+    
+    <!-- Issuance Section -->
+    <div id="issuancePage" class="section">
+      <h2>Issue Credential</h2>
+      <form id="issueForm">
+        <label for="mnemonic">Issuer Wallet Mnemonic (Authorized Issuer Only):</label>
+        <!-- Mask the mnemonic on entry -->
+        <input type="password" id="mnemonic" required placeholder="Enter your wallet mnemonic">
+        
+        <label for="name">Name:</label>
+        <input type="text" id="name" required>
+        
+        <label for="dob">Date of Birth:</label>
+        <input type="date" id="dob" required>
+        
+        <label for="semester">Semester:</label>
+        <input type="text" id="semester" required>
+        
+        <label for="subjects">Subjects (comma separated):</label>
+        <input type="text" id="subjects" required>
+        
+        <label for="marks">Marks (comma separated corresponding to subjects):</label>
+        <input type="text" id="marks" required>
+        
+        <label for="photo">Upload Photo:</label>
+        <input type="file" id="photo" accept="image/*" required>
+        
+        <button type="submit">Submit & Issue Credential</button>
+      </form>
+      <div id="issuanceStatus"></div>
+      <div id="qrCode"></div>
+    </div>
+    
+    <!-- Verification Scanning Section -->
+    <div id="verificationSection" class="section">
+      <h2>Verify Credential</h2>
+      <button id="startScan">Start Camera QR Code Scan</button>
+      <!-- Container for the live QR scanner -->
+      <div id="qr-reader"></div>
+      <br>
+      <label for="qrUpload">Or upload a QR Code image:</label>
+      <input type="file" id="qrUpload" accept="image/*">
+    </div>
+    
+    <!-- Verification Result Page (initially hidden) -->
+    <div id="verificationResultPage" class="section">
+      <h2>Verification Result</h2>
+      <div id="credentialDisplay"></div>
+      <div id="verificationMessage" style="font-weight: bold; margin-top: 10px;"></div>
+      <button id="backToScan">Back to Scan</button>
+    </div>
+  </div>
+  
+  <script>
+    // ----- Utility Functions -----
+    async function computeSHA256(message) {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(message);
+      const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return "0x" + hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+    }
+
+    function compressImage(file, targetKB, callback) {
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const img = new Image();
+        img.onload = function() {
+          const canvas = document.createElement("canvas");
+          const ctx = canvas.getContext("2d");
+          const maxDim = 100; // Adjust as needed.
+          let width = img.width;
+          let height = img.height;
+          if (width > height) {
+            if (width > maxDim) {
+              height = Math.round(height * (maxDim / width));
+              width = maxDim;
+            }
+          } else {
+            if (height > maxDim) {
+              width = Math.round(width * (maxDim / height));
+              height = maxDim;
+            }
+          }
+          canvas.width = width;
+          canvas.height = height;
+          ctx.drawImage(img, 0, 0, width, height);
+          let quality = 0.9;
+          const minQuality = 0.1;
+          function tryCompress() {
+            canvas.toBlob(function(blob) {
+              if (!blob) { callback(null); return; }
+              const sizeKB = blob.size / 1024;
+              console.log(`Compressed size: ${sizeKB.toFixed(2)} KB at quality ${quality}`);
+              if (sizeKB <= targetKB || quality <= minQuality) {
+                const reader2 = new FileReader();
+                reader2.onloadend = function() { callback(reader2.result); };
+                reader2.readAsDataURL(blob);
+              } else {
+                quality -= 0.1;
+                tryCompress();
+              }
+            }, "image/jpeg", quality);
+          }
+          tryCompress();
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    // Mask the mnemonic by showing only the first and last character of each word.
+    function maskMnemonic(mnemonic) {
+      return mnemonic.split(" ").map(word => {
+        if (word.length > 2) {
+          return word[0] + "*".repeat(word.length - 2) + word[word.length - 1];
+        }
+        return word;
+      }).join(" ");
+    }
+
+    // ----- Configuration -----
+    const DESTINATION_ADDRESS = "0x000000000000000000000000000000000000dEaD"; // Example destination address
+    const rpcEndpoint = "https://polygon-rpc.com"; // Polygon RPC endpoint
+
+    // ----- Issuance Logic -----
+    document.getElementById("issueForm").addEventListener("submit", async function(event) {
+      event.preventDefault();
+      document.getElementById("issuanceStatus").innerText = "Processing...";
+
+      // Collect form data.
+      const mnemonic = document.getElementById("mnemonic").value.trim();
+      //console.log("Masked mnemonic:", maskMnemonic(mnemonic));
+      const name = document.getElementById("name").value.trim();
+      const dob = document.getElementById("dob").value;
+      const semester = document.getElementById("semester").value.trim();
+      const subjects = document.getElementById("subjects").value.trim().split(",");
+      const marks = document.getElementById("marks").value.trim().split(",");
+      const photoFile = document.getElementById("photo").files[0];
+      if (!photoFile) {
+        document.getElementById("issuanceStatus").innerText = "Please upload a photo.";
+        return;
+      }
+
+      compressImage(photoFile, 2, async function(photoBase64) {
+        if (!photoBase64) {
+          document.getElementById("issuanceStatus").innerText = "Error compressing image.";
+          return;
+        }
+
+        const dataObject = { name, dob, semester, subjects, marks, photo: photoBase64 };
+        const jsonData = JSON.stringify(dataObject);
+        const dataHash = await computeSHA256(jsonData);
+        console.log("Computed Data Hash:", dataHash);
+
+        try {
+          const wallet = ethers.Wallet.fromMnemonic(mnemonic);
+          const authorizedAddress = wallet.address;
+          console.log("Authorized Address:", authorizedAddress);
+          const provider = new ethers.providers.JsonRpcProvider(rpcEndpoint);
+          const signer = wallet.connect(provider);
+          const txObj = { to: DESTINATION_ADDRESS, value: 0, data: dataHash, from: authorizedAddress };
+
+          let estimatedGas;
+          try {
+            estimatedGas = await provider.estimateGas(txObj);
+            console.log("Estimated Gas:", estimatedGas.toString());
+          } catch (gasError) {
+            console.warn("Gas estimation failed, using fallback gas limit. Error:", gasError.message);
+            estimatedGas = ethers.BigNumber.from("200000");
+          }
+
+          const currentGasPrice = await provider.getGasPrice();
+          const boostedGasPrice = currentGasPrice.mul(120).div(100);
+          console.log("Boosted Gas Price:", boostedGasPrice.toString());
+
+          const tx = await signer.sendTransaction({
+            ...txObj,
+            type: 0,
+            gasLimit: estimatedGas,
+            gasPrice: boostedGasPrice
+          });
+
+          document.getElementById("issuanceStatus").innerText = "Transaction sent. Waiting for confirmation...";
+          console.log("Transaction sent:", tx.hash);
+          const receipt = await tx.wait();
+          console.log("Transaction confirmed:", receipt.transactionHash);
+          document.getElementById("issuanceStatus").innerText = "Credential issued. Transaction ID: " + receipt.transactionHash;
+
+          // Generate a QR code with the credential data, issuer address, and transaction ID.
+          const qrData = { issuer: authorizedAddress, data: dataObject, txId: receipt.transactionHash };
+          const qr = new QRious({
+            element: document.createElement("canvas"),
+            value: JSON.stringify(qrData),
+            size: 400,
+            level: "L",
+            padding: 10
+          });
+          const qrDiv = document.getElementById("qrCode");
+          qrDiv.innerHTML = "";
+          qrDiv.appendChild(qr.element);
+        } catch (error) {
+          console.error("Error during issuance:", error);
+          document.getElementById("issuanceStatus").innerText = "Error: " + error.message;
+        }
+      });
+    });
+
+    // ----- Verification Logic -----
+    async function processDecodedQrCode(decodedText) {
+      try {
+        const qrData = JSON.parse(decodedText);
+        const scannedData = JSON.stringify(qrData.data);
+        const scannedTxId = qrData.txId;
+        const expectedIssuer = qrData.issuer;
+
+        const computedHash = await computeSHA256(scannedData);
+        console.log("Computed Hash from Scanned Data:", computedHash);
+
+        const provider = new ethers.providers.JsonRpcProvider(rpcEndpoint);
+        const tx = await provider.getTransaction(scannedTxId);
+        if (!tx) {
+          showVerificationResult("Transaction not found on Polygon PoS Chain.", null);
+          return;
+        }
+        console.log("Retrieved Transaction:", tx);
+        const block = await provider.getBlock(tx.blockNumber);
+        const txDateTime = new Date(block.timestamp * 1000).toLocaleString();
+
+        let verificationMessage = "";
+        if (tx.from.toLowerCase() !== expectedIssuer.toLowerCase()) {
+          verificationMessage = "Verification Failed: Transaction not from the expected issuer.";
+        } else if (tx.data.toLowerCase() !== computedHash.toLowerCase()) {
+          verificationMessage = "Verification Failed: Data mismatch.";
+        } else {
+          verificationMessage = "Verification Successful: Data is authentic.";
+        }
+        showVerificationResult(verificationMessage, qrData.data, scannedTxId, txDateTime);
+      } catch (error) {
+        console.error("Error during verification:", error);
+        showVerificationResult("Error: " + error.message, null);
+      }
+    }
+
+    function showVerificationResult(message, credentialData, txId, txDateTime) {
+      let dataHtml = "";
+      if (credentialData) {
+        dataHtml += "<h3>Credential Data</h3>";
+        dataHtml += `<p><strong>Name:</strong> ${credentialData.name}</p>`;
+        dataHtml += `<p><strong>Date of Birth:</strong> ${credentialData.dob}</p>`;
+        dataHtml += `<p><strong>Semester:</strong> ${credentialData.semester}</p>`;
+        dataHtml += `<p><strong>Subjects:</strong> ${credentialData.subjects.join(", ")}</p>`;
+        dataHtml += `<p><strong>Marks:</strong> ${credentialData.marks.join(", ")}</p>`;
+        dataHtml += `<p><strong>Photo:</strong><br><img src="${credentialData.photo}" alt="Credential Photo" style="max-width:300px;"></p>`;
+        if (txId && txDateTime) {
+          dataHtml += `<p><strong>Transaction:</strong> <a href="https://polygonscan.com/tx/${txId}" target="_blank">${txId}</a></p>`;
+          dataHtml += `<p><strong>Transaction Date & Time:</strong> ${txDateTime}</p>`;
+        }
+      }
+      document.getElementById("credentialDisplay").innerHTML = dataHtml;
+
+      const verificationMessageElem = document.getElementById("verificationMessage");
+      verificationMessageElem.innerText = message;
+      if (message.toLowerCase().includes("successful")) {
+        verificationMessageElem.style.color = "green";
+      } else if (message.toLowerCase().includes("failed")) {
+        verificationMessageElem.style.color = "red";
+      } else {
+        verificationMessageElem.style.color = "blue";
+      }
+      document.getElementById("verificationSection").style.display = "none";
+      document.getElementById("verificationResultPage").style.display = "block";
+    }
+
+// ----- QR Code Scanning with html5-qrcode (Camera) -----
+  document.getElementById("startScan").addEventListener("click", function() {
+  const qrReader = document.getElementById("qr-reader");
+  qrReader.style.display = "block";
+
+  const html5QrCode = new Html5Qrcode("qr-reader");
+
+  const qrConfig = {
+    fps: 10,
+    qrbox: { width: 250, height: 250 },
+    aspectRatio: 1.0
+  };
+
+  html5QrCode.start(
+    { facingMode: "environment" }, // Explicitly requests the rear camera
+    qrConfig,
+    (decodedText, decodedResult) => {
+      console.log("QR Code detected:", decodedText);
+      html5QrCode.stop().then(() => {
+        qrReader.style.display = "none";
+        processDecodedQrCode(decodedText);
+      }).catch(err => {
+        console.error("Failed to stop scanning:", err);
+      });
+    },
+    errorMessage => {
+      console.warn("Scanning error (temporary):", errorMessage);
+    }
+  ).catch(err => {
+    console.error("Unable to initiate camera scanning:", err);
+    alert("Error starting camera. Ensure camera permissions are granted and you're using HTTPS.");
+  });
+});
+
+    // ----- File Scanning using jsQR -----
+    document.getElementById("qrUpload").addEventListener("change", function(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const img = new Image();
+        img.onload = function() {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const context = canvas.getContext("2d");
+          context.drawImage(img, 0, 0);
+          const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imageData.data, canvas.width, canvas.height);
+          if (code) {
+            console.log("File scan result:", code.data);
+            processDecodedQrCode(code.data);
+          } else {
+            console.error("QR code not detected in the uploaded image.");
+          }
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+
+    // "Back to Scan" button functionality.
+    document.getElementById("backToScan").addEventListener("click", function() {
+      document.getElementById("verificationResultPage").style.display = "none";
+      document.getElementById("verificationSection").style.display = "block";
+    });
+  </script>
+</body>
+</html>
